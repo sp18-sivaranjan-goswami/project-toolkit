@@ -1,13 +1,18 @@
-"""Claude API integration for retrofit stack detection and file generation."""
+"""Claude API integration for retrofit stack detection and file generation.
+
+Uses the `claude` CLI in headless mode (-p) so that authentication is handled
+transparently by Claude Code regardless of whether the user authenticated via
+OAuth or API key. Falls back to the Anthropic SDK if ANTHROPIC_API_KEY is set.
+"""
 
 from __future__ import annotations
 
+import json
+import re
+import subprocess
+import shutil
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
-
-import anthropic
-
-from proj_toolkit.detector import RepoContext
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -50,201 +55,186 @@ class RetrofitFiles:
 
 
 # ---------------------------------------------------------------------------
-# Tool schemas
-# ---------------------------------------------------------------------------
-
-_DETECT_TOOL: Dict[str, Any] = {
-    "name": "report_stack",
-    "description": "Report the detected technology stack for the repository.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "language": {
-                "type": "string",
-                "description": "Primary programming language",
-                "enum": ["python", "javascript", "typescript", "go", "rust", "java", "ruby", "other"],
-            },
-            "frontend": {
-                "type": "string",
-                "description": "Frontend framework, or 'none' if backend-only",
-                "enum": ["react", "vue", "angular", "svelte", "nextjs", "nuxtjs", "none", "unknown"],
-            },
-            "backend": {
-                "type": "string",
-                "description": "Backend framework",
-                "enum": ["django", "fastapi", "flask", "express", "nestjs", "rails", "spring", "none", "unknown"],
-            },
-            "database": {
-                "type": "string",
-                "enum": ["postgresql", "mysql", "sqlite", "mongodb", "redis", "none", "unknown"],
-            },
-            "testing": {
-                "type": "string",
-                "enum": ["pytest", "jest", "vitest", "mocha", "rspec", "unknown", "none"],
-            },
-            "package_manager": {
-                "type": "string",
-                "enum": ["npm", "yarn", "pnpm", "pip", "poetry", "cargo", "bundler", "unknown"],
-            },
-            "is_monorepo": {
-                "type": "boolean",
-                "description": "True if this appears to be a monorepo with multiple apps/packages",
-            },
-            "notable_patterns": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Up to 5 notable patterns, e.g. 'REST API', 'GraphQL', 'Docker Compose', 'GitHub Actions CI'",
-            },
-            "confidence": {
-                "type": "string",
-                "enum": ["high", "medium", "low"],
-                "description": "How confident you are in this detection",
-            },
-        },
-        "required": [
-            "language", "frontend", "backend", "database",
-            "testing", "package_manager", "is_monorepo",
-            "notable_patterns", "confidence",
-        ],
-    },
-}
-
-_GENERATE_TOOL: Dict[str, Any] = {
-    "name": "write_retrofit_files",
-    "description": "Write the three Claude Code documentation files for the repository.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "claude_md": {
-                "type": "string",
-                "description": (
-                    "Content of CLAUDE.md — root-level instructions for Claude Code agents. "
-                    "Include: project overview, stack-specific commands (dev/test/build/lint), "
-                    "key file paths, inferred coding conventions, and agent boundaries. "
-                    "Be specific to this repo, not generic."
-                ),
-            },
-            "context_md": {
-                "type": "string",
-                "description": (
-                    "Content of claude/context.md — structured reference for agents. "
-                    "Include: architecture overview, module/directory descriptions, "
-                    "key dependencies, data flow if inferrable, external services."
-                ),
-            },
-            "agents_md": {
-                "type": "string",
-                "description": (
-                    "Content of claude/AGENTS.md — multi-agent coordination rules. "
-                    "Define agent boundaries based on actual directory layout, "
-                    "task file protocol, and repo-specific constraints."
-                ),
-            },
-            "suggested_skills": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": ["dev", "build", "test", "commit", "review", "migrate", "lint", "deploy", "seed"],
-                },
-                "description": "Slash command skill names appropriate for this stack",
-            },
-        },
-        "required": ["claude_md", "context_md", "agents_md", "suggested_skills"],
-    },
-}
-
-
-# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def detect_stack(context: RepoContext) -> StackInfo:
-    """Call Claude Sonnet to identify the tech stack. Uses tool_use for reliable structure."""
-    client = anthropic.Anthropic()
+def detect_stack(context: "RepoContext", model: str = "claude-sonnet-4-6") -> StackInfo:  # noqa: F821
+    """Detect the tech stack by calling Claude. Returns structured StackInfo."""
+    prompt = f"""\
+Analyze this repository and return a JSON object identifying the tech stack.
+Return ONLY the JSON object — no explanation, no markdown fences.
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=(
-            "You are a software architecture expert. "
-            "Analyze the repository context and call report_stack with your findings."
-        ),
-        tools=[_DETECT_TOOL],
-        tool_choice={"type": "any"},
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Analyze this repository and report the tech stack:\n\n"
-                    + context.to_prompt_text()
-                ),
-            }
-        ],
-    )
+Required JSON schema:
+{{
+  "language": "<python|javascript|typescript|go|rust|java|ruby|other>",
+  "frontend": "<react|vue|angular|svelte|nextjs|nuxtjs|none|unknown>",
+  "backend": "<django|fastapi|flask|express|nestjs|rails|spring|none|unknown>",
+  "database": "<postgresql|mysql|sqlite|mongodb|redis|none|unknown>",
+  "testing": "<pytest|jest|vitest|mocha|rspec|none|unknown>",
+  "package_manager": "<npm|yarn|pnpm|pip|poetry|cargo|bundler|unknown>",
+  "is_monorepo": <true|false>,
+  "notable_patterns": ["<up to 5 patterns>"],
+  "confidence": "<high|medium|low>"
+}}
 
-    tool_input = _extract_tool_input(response, "report_stack")
+Repository context:
+
+{context.to_prompt_text()}
+"""
+    raw = _call_claude(prompt, model=model)
+    data = _parse_json(raw)
     return StackInfo(
-        language=tool_input["language"],
-        frontend=tool_input["frontend"],
-        backend=tool_input["backend"],
-        database=tool_input["database"],
-        testing=tool_input["testing"],
-        package_manager=tool_input["package_manager"],
-        is_monorepo=tool_input["is_monorepo"],
-        notable_patterns=tool_input.get("notable_patterns", []),
-        confidence=tool_input["confidence"],
+        language=data.get("language", "unknown"),
+        frontend=data.get("frontend", "unknown"),
+        backend=data.get("backend", "unknown"),
+        database=data.get("database", "unknown"),
+        testing=data.get("testing", "unknown"),
+        package_manager=data.get("package_manager", "unknown"),
+        is_monorepo=bool(data.get("is_monorepo", False)),
+        notable_patterns=data.get("notable_patterns", []),
+        confidence=data.get("confidence", "low"),
     )
 
 
 def generate_retrofit_files(
     project_name: str,
-    context: RepoContext,
+    context: "RepoContext",  # noqa: F821
     stack: StackInfo,
     model: str = "claude-sonnet-4-6",
 ) -> RetrofitFiles:
-    """Call Claude to generate all retrofit documentation files via tool_use."""
-    client = anthropic.Anthropic()
+    """Call Claude to generate all retrofit documentation files."""
+    prompt = f"""\
+You are an expert developer assistant specialising in Claude Code agentic workflows.
+Generate three Markdown documentation files for the project "{project_name}".
+Base everything on the actual repository — do not use generic placeholders.
 
-    prompt = (
-        f'Generate Claude Code documentation files for the project "{project_name}".\n\n'
-        f"## Detected Stack\n{stack.to_summary()}\n\n"
-        f"## Repository Context\n{context.to_prompt_text()}\n\n"
-        "Call write_retrofit_files with precise, repo-specific content for each file. "
-        "Do not use generic templates — base everything on the actual files and structure shown above."
+## Detected Stack
+{stack.to_summary()}
+
+## Repository Context
+{context.to_prompt_text()}
+
+---
+
+Output the three files using EXACTLY these delimiters (nothing before the first delimiter):
+
+<<<CLAUDE.md>>>
+Write CLAUDE.md here — root-level instructions for Claude Code agents.
+Include: project overview, exact dev/test/build/lint commands for this stack,
+key file paths, coding conventions inferred from the code, agent boundaries.
+
+<<<context.md>>>
+Write claude/context.md here — structured reference for agents.
+Include: architecture overview, module/directory descriptions based on the real
+directory structure, key dependencies, data flow if inferrable, external services.
+
+<<<AGENTS.md>>>
+Write claude/AGENTS.md here — multi-agent coordination rules.
+Define agent boundaries based on the actual directory layout, task file protocol,
+and any repo-specific constraints agents must respect.
+
+<<<SKILLS>>>
+List slash command skill names for this stack, one per line, no bullets.
+Choose only from: dev, build, test, commit, review, migrate, lint, deploy, seed
+"""
+    raw = _call_claude(prompt, model=model)
+    return _parse_retrofit_files(raw)
+
+
+# ---------------------------------------------------------------------------
+# Transport: claude CLI (primary) or Anthropic SDK (fallback)
+# ---------------------------------------------------------------------------
+
+def _call_claude(prompt: str, model: str = "claude-sonnet-4-6") -> str:
+    """Call Claude via the `claude` CLI or Anthropic SDK and return the text response."""
+    if shutil.which("claude"):
+        return _call_via_cli(prompt, model)
+    return _call_via_sdk(prompt, model)
+
+
+def _call_via_cli(prompt: str, model: str) -> str:
+    """Use `claude -p` (Claude Code headless mode). Handles auth transparently."""
+    result = subprocess.run(
+        ["claude", "-p", prompt, "--output-format", "json", "--model", model],
+        capture_output=True,
+        text=True,
+        timeout=180,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude CLI exited with code {result.returncode}.\n"
+            f"stderr: {result.stderr.strip()}"
+        )
+    try:
+        data = json.loads(result.stdout)
+        return data.get("result", result.stdout)
+    except json.JSONDecodeError:
+        return result.stdout
 
-    response = client.messages.create(
+
+def _call_via_sdk(prompt: str, model: str) -> str:
+    """Fall back to direct Anthropic SDK (requires ANTHROPIC_API_KEY)."""
+    import anthropic
+    client = anthropic.Anthropic()
+    message = client.messages.create(
         model=model,
         max_tokens=8192,
-        system=(
-            "You are an expert developer assistant specialising in Claude Code agentic workflows. "
-            "You write precise, actionable documentation for Claude Code agents. "
-            "Your files are specific to the actual codebase, never generic placeholders."
-        ),
-        tools=[_GENERATE_TOOL],
-        tool_choice={"type": "any"},
         messages=[{"role": "user", "content": prompt}],
     )
+    return message.content[0].text
 
-    tool_input = _extract_tool_input(response, "write_retrofit_files")
+
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+
+def _parse_json(text: str) -> Dict[str, Any]:
+    text = text.strip()
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+        text = text.strip()
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Extract first JSON object from the text
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    raise ValueError(f"Could not parse JSON from response:\n{text[:300]}")
+
+
+def _parse_retrofit_files(raw: str) -> RetrofitFiles:
+    def _extract(marker: str, next_markers: List[str]) -> str:
+        start_tag = f"<<<{marker}>>>"
+        start = raw.find(start_tag)
+        if start == -1:
+            return ""
+        start += len(start_tag)
+        end = len(raw)
+        for nm in next_markers:
+            pos = raw.find(f"<<<{nm}>>>", start)
+            if 0 < pos < end:
+                end = pos
+        return raw[start:end].strip()
+
+    claude_md = _extract("CLAUDE.md", ["context.md", "AGENTS.md", "SKILLS"])
+    context_md = _extract("context.md", ["AGENTS.md", "SKILLS"])
+    agents_md = _extract("AGENTS.md", ["SKILLS"])
+    skills_raw = _extract("SKILLS", [])
+
+    suggested_skills = [
+        line.strip().lstrip("- ").strip()
+        for line in skills_raw.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
     return RetrofitFiles(
-        claude_md=tool_input["claude_md"],
-        context_md=tool_input["context_md"],
-        agents_md=tool_input["agents_md"],
-        suggested_skills=tool_input.get("suggested_skills", []),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _extract_tool_input(response: anthropic.types.Message, tool_name: str) -> Dict[str, Any]:
-    for block in response.content:
-        if block.type == "tool_use" and block.name == tool_name:
-            return block.input  # type: ignore[return-value]
-    raise RuntimeError(
-        f"Claude did not call the expected tool '{tool_name}'. "
-        f"Stop reason: {response.stop_reason}. "
-        f"Response: {response.content}"
+        claude_md=claude_md,
+        context_md=context_md,
+        agents_md=agents_md,
+        suggested_skills=suggested_skills,
     )

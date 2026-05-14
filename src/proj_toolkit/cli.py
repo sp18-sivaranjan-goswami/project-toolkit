@@ -140,16 +140,15 @@ def _run_retrofit(target: Path, doc_paths: List[Path], model: str) -> None:
 
 
 def _handle_api_error(exc: Exception) -> None:
-    import anthropic
-
-    if isinstance(exc, anthropic.AuthenticationError):
+    msg = str(exc)
+    if "authentication" in msg.lower() or "api_key" in msg.lower() or "auth" in msg.lower():
         console.print(
-            "[bold red]Authentication error:[/bold red] ANTHROPIC_API_KEY is missing or invalid.\n"
-            "Run [bold]claude auth[/bold] or set the ANTHROPIC_API_KEY environment variable."
+            "[bold red]Authentication error:[/bold red] Could not authenticate with Claude.\n"
+            "Make sure Claude Code is installed and run [bold]claude auth[/bold] to log in."
         )
-    elif isinstance(exc, anthropic.RateLimitError):
+    elif "rate limit" in msg.lower():
         console.print(
             "[bold red]Rate limit error:[/bold red] Too many requests. Wait a moment and try again."
         )
     else:
-        console.print(f"[bold red]Error calling Claude API:[/bold red] {exc}")
+        console.print(f"[bold red]Error calling Claude:[/bold red] {exc}")
