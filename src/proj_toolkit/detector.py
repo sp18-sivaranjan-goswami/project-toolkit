@@ -132,15 +132,9 @@ def _read_docs(doc_paths: List[Path]) -> str:
 
 def _extract_pdf(path: Path) -> str:
     try:
-        import pypdf  # type: ignore
+        import pypdf
         reader = pypdf.PdfReader(str(path))
         texts = [page.extract_text() or "" for page in reader.pages[:20]]
         return "\n".join(texts)[:15_000]
-    except ImportError:
-        return (
-            "[PDF parsing requires the `pypdf` package. "
-            "Install it with: pip install 'proj-toolkit[pdf]']\n"
-            f"File skipped: {path}"
-        )
     except Exception as exc:
         return f"[Could not parse PDF: {exc}]"

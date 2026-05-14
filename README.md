@@ -12,12 +12,6 @@ Not yet on PyPI — install directly from GitHub:
 pip install git+https://github.com/sp18-sivaranjan-goswami/project-toolkit.git
 ```
 
-**Optional: PDF documentation support**
-
-```bash
-pip install "proj-toolkit[pdf] @ git+https://github.com/sp18-sivaranjan-goswami/project-toolkit.git"
-```
-
 ## Usage
 
 ### New project (empty directory)
