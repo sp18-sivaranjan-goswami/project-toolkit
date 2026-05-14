@@ -10,7 +10,7 @@ from proj_toolkit.config import ProjectConfig
 from proj_toolkit.frameworks.base import FrameworkPlugin
 
 # Resolve templates/ directory relative to this package
-_TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
+_TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
 def render_claude_md(
